@@ -138,6 +138,35 @@ exports.star_listening = () => {
       }
     },
 
+    "rangeDownload": async (options) => {
+      let video_url = options?.video_url;
+      let audio_url = options?.audio_url;
+      let path = options?.path;
+      let chunk_size = options?.chunk_size;
+      let file_size = options?.file_size;
+      let qr_code_path = options?.qr_code_path;
+
+      if (!video_url || !filename_no_extension || !chunk_size || !file_size) {
+        throw new Error("Missing argument");
+      }
+
+      // Get Video
+
+      https.get(video_url, (res) => {
+        console.log('statusCode:', res.statusCode);
+        console.log('headers:', res.headers);
+
+        res.on('data', (d) => {
+          process.stdout.write(d);
+        });
+
+      }).on('error', (e) => {
+        console.error(e);
+      }); 
+
+
+    },
+
     // FIXME: Partly in test suite. But just for hls retrieval.
     "convert": async (args = ["-h"], options = {}) => {
       // `-progress pipe:1` send program-friendly progress information to stdin every 500ms.
