@@ -1,7 +1,4 @@
-⚠️⚠️⚠️ VDH CoApp is not being developed anymore - VDH v10 doesn't require a companion. ⚠️⚠️⚠️
-
----
-
+### Note:
 
 ⚠️ This is a developer dedicated place. If you are a user and need help with Video DownloadHelper and/or its companion app:
 
@@ -9,11 +6,11 @@
 - if you have an issue with the CoApp not being registered, [read this](https://github.com/aclap-dev/video-downloadhelper/wiki/CoApp-not-recognized).
 - [all the documentation is here](https://github.com/aclap-dev/video-downloadhelper/wiki).
 - you can [ask questions here](https://github.com/aclap-dev/video-downloadhelper/discussions).
-
+- VDH-v10 does NOT require a companion-app, this is only maintained in favor of clean-room reproduce of VDH-v9's source-code, since said version supports more browser versions.
 
 # DownloadHelper CoApp
 
-*DownloadHelper CoApp* is a multi-platform (Windows, Mac, Linux) application
+_DownloadHelper CoApp_ is a multi-platform (Windows, Mac, Linux) application
 providing the [Video DownloadHelper](https://downloadhelper.net/)
 browser add-on with a set of extra features not available directly
 from the add-on:
@@ -22,7 +19,7 @@ from the add-on:
 - launching default video player application on a data file
 - a build of the [ffmpeg](http://ffmpeg.org/) video converter
 
-*DownloadHelper CoApp* complies with the
+_DownloadHelper CoApp_ complies with the
 [native messaging protocol](https://developer.mozilla.org/en-US/Add-ons/WebExtensions/Native_messaging)
 and is not intended to be used directly from the command line.
 
