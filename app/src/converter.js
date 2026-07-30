@@ -225,7 +225,7 @@ exports.star_listening = () => {
       return new Promise((resolve, reject) => {
         let args = [];
         if (json) {
-          args = ["-v", "quiet", "-print_format", "json", "-show_format", "-show_streams"];
+          args = ["-v", "error", "-print_format", "json", "-show_format", "-show_streams"];
         }
         if (headers.length) {
           args.push("-headers");
