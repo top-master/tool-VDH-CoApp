@@ -99,7 +99,7 @@ WriteRegStr ${REG_ROOT} "${UNINSTALL_PATH}"  "DisplayVersion" "${VERSION}"
 WriteRegStr ${REG_ROOT} "${UNINSTALL_PATH}"  "Publisher" "${COMP_NAME}"
 
 <% for (let name in store) { %>
-<%   let regs = store[name].msg_manifest_paths.windows.regs; %>
+<%   let win = (store[name].msg_manifest_paths || {}).windows; let regs = (win && win.regs) || []; %>
 <%   for (let reg of regs) { %>
 WriteRegStr ${REG_ROOT} "<%= reg %>\<%= meta.id %>" "" "$INSTDIR\<%= name %>.json"
 <%   } %>
@@ -118,7 +118,7 @@ DeleteRegKey ${REG_ROOT} "${REG_APP_PATH}"
 DeleteRegKey ${REG_ROOT} "${UNINSTALL_PATH}"
 
 <% for (let name in store) { %>
-<%   let regs = store[name].msg_manifest_paths.windows.regs; %>
+<%   let win = (store[name].msg_manifest_paths || {}).windows; let regs = (win && win.regs) || []; %>
 <%   for (let reg of regs) { %>
 DeleteRegKey ${REG_ROOT} "<%= reg %>\<%= meta.id %>"
 <%   } %>
