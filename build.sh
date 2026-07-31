@@ -349,7 +349,9 @@ cp $dist_dir/$filepicker_target $target_dist_dir/filepicker$exe_extension
 
 if [[ ! -d $dist_dir/$ffmpeg_target_dir ]]; then
   log "Retrieving ffmpeg"
-  ffmpeg_url_base="https://github.com/aclap-dev/ffmpeg-static-builder/releases/download/"
+  # Fork of aclap-dev/ffmpeg-static-builder; the upstream repo was removed, so we
+  # pull the static ffmpeg builds from our own fork's releases.
+  ffmpeg_url_base="https://github.com/top-master/ext-VDH-ffmpeg-builder/releases/download"
   ffmpeg_url=$ffmpeg_url_base/v$package_ffmpeg_build_version/$ffmpeg_target.tar.bz2
   ffmpeg_tarball=$dist_dir/$ffmpeg_target.tar.bz2
   wget --show-progress -c -O $ffmpeg_tarball $ffmpeg_url
