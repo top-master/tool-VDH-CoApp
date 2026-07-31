@@ -7,7 +7,7 @@ version = "2.0.19"
 
 [package]
 binary_name = "vdhcoapp" # .exe added automatically
-ffmpeg_build_version = "2.0.5"
+ffmpeg_build_version = "2.0.6"
 filepicker_build_version = "1.0.1"
 
 [package.windows]
