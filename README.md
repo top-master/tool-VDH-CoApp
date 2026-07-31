@@ -1,39 +1,45 @@
-### Note:
-
-⚠️ This is a developer dedicated place. If you are a user and need help with Video DownloadHelper and/or its companion app:
-
-- you can find [all relevant links here](https://github.com/aclap-dev/video-downloadhelper).
-- if you have an issue with the CoApp not being registered, [read this](https://github.com/aclap-dev/video-downloadhelper/wiki/CoApp-not-recognized).
-- [all the documentation is here](https://github.com/aclap-dev/video-downloadhelper/wiki).
-- you can [ask questions here](https://github.com/aclap-dev/video-downloadhelper/discussions).
-- VDH-v10 does NOT require a companion-app, this is only maintained in favor of clean-room reproduce of VDH-v9's source-code, since said version supports more browser versions.
-
 # DownloadHelper CoApp
 
-_DownloadHelper CoApp_ is a multi-platform (Windows, Mac, Linux) application
-providing the [Video DownloadHelper](https://downloadhelper.net/)
-browser add-on with a set of extra features not available directly
-from the add-on:
+➡️ **Main project: [github.com/top-master/ext-VDH](https://github.com/top-master/ext-VDH)**
+— the browser extension, documentation, and issue tracker. This repository is
+only its native companion app; please start there.
+
+---
+
+⚠️ This is a developer-oriented repository. It maintains the native companion app
+for **[ext-VDH](https://github.com/top-master/ext-VDH)**, a clean-room
+reproduction of Video DownloadHelper v9 (kept because v9 supports more browser
+versions; VDH v10 needs no companion app).
+
+If the CoApp is not recognized by the browser, see
+[CoApp-not-recognized](docs/CoApp-not-recognized.md).
+
+## What it is
+
+_DownloadHelper CoApp_ is a multi-platform (Windows, Mac, Linux) application that
+gives the [ext-VDH](https://github.com/top-master/ext-VDH) browser add-on a set
+of features it cannot provide on its own:
 
 - file writing API
-- launching default video player application on a data file
-- a build of the [ffmpeg](http://ffmpeg.org/) video converter
+- launching the default video-player application on a data file
+- a bundled [ffmpeg](http://ffmpeg.org/) converter, with a local HTTP/2 media
+  proxy so HTTP/2-only CDNs (which reject ffmpeg's HTTP/1.1 requests) still work
 
-_DownloadHelper CoApp_ complies with the
+It complies with the
 [native messaging protocol](https://developer.mozilla.org/en-US/Add-ons/WebExtensions/Native_messaging)
 and is not intended to be used directly from the command line.
 
-Installer executables for the various platforms are available
-from the [releases page](https://github.com/aclap-dev/vdhcoapp/releases).
+Installer executables for the various platforms are available from the
+[releases page](https://github.com/top-master/tool-VDH-CoApp/releases).
 
-# Note about the registration process
+## Note about the registration process
 
-After the app is installed, the coapp installs a json file into browser-specific directories,
-as described by the Mozilla, Google and Microsoft documentation:
+After the app is installed, the CoApp writes a JSON manifest into browser-specific
+directories, as described by the Mozilla, Google and Microsoft documentation:
 
 - https://developer.mozilla.org/en-US/docs/Mozilla/Add-ons/WebExtensions/Native_manifests
 - https://developer.chrome.com/docs/extensions/mv3/nativeMessaging/#native-messaging-host-location
 - https://learn.microsoft.com/en-us/microsoft-edge/extensions-chromium/developer-guide/native-messaging?tabs=v3%2Cwindows
 
 You can see the list of files installed by running `vdhcoapp install`.
-Those files can be remove with `vdhcoapp uninstall`.
+Those files can be removed with `vdhcoapp uninstall`.
