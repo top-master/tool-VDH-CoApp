@@ -6,6 +6,7 @@ const fs = require("node:fs");
 
 const logger = require('./logger');
 const rpc = require('./weh-rpc');
+const { Http2MediaProxy } = require('./media-proxy');
 
 const exec_dir = path.dirname(process.execPath);
 
@@ -99,6 +100,123 @@ function ExecConverter(args) {
   });
 }
 
+// Run ffprobe once. Resolves to the parsed info (or raw json), rejects with an
+// "Exit code: N\n<stderr>" error carrying ffprobe's reason.
+function runFfprobe(input, json, headers) {
+  return new Promise((resolve, reject) => {
+    let args = [];
+    if (json) {
+      args = ["-v", "error", "-print_format", "json", "-show_format", "-show_streams"];
+    }
+    if (headers.length) {
+      args.push("-headers");
+      args.push(headers.map((h) => h.name + ": " + h.value).join("\r\n") + "\r\n");
+    }
+    args.push(input);
+
+    let probeProcess = spawn(ffprobe, args);
+    let stdout = "";
+    let stderr = "";
+    probeProcess.stdout.on("data", (data) => stdout += data);
+    probeProcess.stderr.on("data", (data) => stderr += data);
+    probeProcess.on("exit", (exitCode) => {
+      if (exitCode !== 0) {
+        return reject(new Error("Exit code: " + exitCode + "\n" + stderr));
+      }
+      if (json) {
+        // FIXME: not parsed?
+        return resolve(stdout);
+      }
+      let info = {};
+      let m = /([0-9]{2,})x([0-9]{2,})/g.exec(stderr);
+      if (m) {
+        info.width = parseInt(m[1]);
+        info.height = parseInt(m[2]);
+      }
+      m = /Duration: ([0-9]{2}):([0-9]{2}):([0-9]{2})\.([0-9]{2})/g.exec(stderr);
+      if (m) {
+        info.duration = parseInt(m[1]) * 3600 + parseInt(m[2]) * 60 + parseInt(m[3]);
+      }
+      m = /Video:\s+([^\s\(,]+)/g.exec(stderr);
+      if (m) {
+        info.videoCodec = m[1];
+      }
+      m = /Audio:\s+([^\s\(,]+)/g.exec(stderr);
+      if (m) {
+        info.audioCodec = m[1];
+      }
+      m = /([0-9]+(?:\.[0-9]+)?)\s+fps\b/g.exec(stderr);
+      if (m) {
+        info.fps = parseFloat(m[1]);
+      }
+      resolve(info);
+    });
+  });
+}
+
+function isHttpUrl(value) {
+  return typeof value === "string" && /^https?:\/\//i.test(value);
+}
+
+// ffmpeg's stderr when a CDN refuses its (HTTP/1.1) request.
+function looksLikeAccessBlock(stderr) {
+  return /\b40[13]\b|access denied|Forbidden|HTTP error 40[13]/i.test(stderr || "");
+}
+
+// Parse every `-headers "Name: v\r\nName2: v2\r\n"` blob in an ffmpeg arg list
+// into a merged [{name, value}] list, so the proxy can forward them upstream.
+function extractHeadersFromArgs(args) {
+  const headers = [];
+  for (let i = 0; i < args.length - 1; i++) {
+    if (args[i] === "-headers") {
+      for (const line of String(args[i + 1]).split(/\r?\n/)) {
+        const at = line.indexOf(":");
+        if (at > 0) {
+          headers.push({ name: line.slice(0, at).trim(), value: line.slice(at + 1).trim() });
+        }
+      }
+    }
+  }
+  return headers;
+}
+
+// Replace each http(s) URL arg with its loopback proxy URL and drop the now-
+// redundant `-headers` args (the proxy injects them upstream itself).
+function rewriteArgsThroughProxy(args, proxy) {
+  const out = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "-headers") {
+      i++; // skip the header blob too
+      continue;
+    }
+    out.push(isHttpUrl(args[i]) ? proxy.proxyUrl(args[i]) : args[i]);
+  }
+  return out;
+}
+
+// Probe an input, retrying through the HTTP/2 media proxy when a direct probe
+// is refused (e.g. an HTTP/2-only CDN rejecting ffprobe's HTTP/1.1 request).
+async function probeWithProxyFallback(input, json, headers) {
+  try {
+    return await runFfprobe(input, json, headers);
+  } catch (directError) {
+    if (!isHttpUrl(input)) {
+      throw directError;
+    }
+    const proxy = new Http2MediaProxy({ headers, logger });
+    try {
+      await proxy.start();
+      const result = await runFfprobe(proxy.proxyUrl(input), json, []);
+      logger.info("probe recovered via media proxy (upstream requires HTTP/2)");
+      return result;
+    } catch (_proxyError) {
+      throw directError; // keep the direct error's ffprobe reason
+    } finally {
+      proxy.stop();
+    }
+  }
+}
+
 exports.star_listening = () => {
 
   const convertChildren = new Map();
@@ -160,120 +278,95 @@ exports.star_listening = () => {
       const ffmpeg_base_args = "-progress pipe:1 -hide_banner -loglevel error";
       args = [...ffmpeg_base_args.split(" "), ...args];
 
-      const child = spawn(ffmpeg, args);
+      // One ffmpeg run: wires progress + child tracking, resolves on exit.
+      const runConvert = (ffmpegArgs) => {
+        const child = spawn(ffmpeg, ffmpegArgs);
 
-      if (!child.pid) {
-        throw new Error("Process creation failed");
-      }
+        if (!child.pid) {
+          throw new Error("Process creation failed");
+        }
 
-      convertChildren.set(child.pid, child);
+        convertChildren.set(child.pid, child);
 
-      let stderr = "";
+        let stderr = "";
 
-      let on_exit = new Promise((resolve) => {
-        child.on("exit", (code) => {
-          convertChildren.delete(child.pid);
-          resolve({exitCode: code, pid: child.pid, stderr});
+        let on_exit = new Promise((resolve) => {
+          child.on("exit", (code) => {
+            convertChildren.delete(child.pid);
+            resolve({exitCode: code, pid: child.pid, stderr});
+          });
         });
-      });
 
-      child.stderr.on("data", (data) => stderr += data);
+        child.stderr.on("data", (data) => stderr += data);
 
-      if (options.startHandler) {
-        rpc.call("convertStartNotification", options.startHandler, child.pid);
-      }
+        if (options.startHandler) {
+          rpc.call("convertStartNotification", options.startHandler, child.pid);
+        }
 
-      const PROPS_RE = new RegExp("\\S+=\\s*\\S+");
-      const NAMEVAL_RE = new RegExp("(\\S+)=\\s*(\\S+)");
-      let progressInfo = {};
+        const PROPS_RE = new RegExp("\\S+=\\s*\\S+");
+        const NAMEVAL_RE = new RegExp("(\\S+)=\\s*(\\S+)");
+        let progressInfo = {};
 
-      const on_line = async (line) => {
-        let props = line.match(PROPS_RE) || [];
-        props.forEach((prop) => {
-          let m = NAMEVAL_RE.exec(prop);
-          if (m) {
-            progressInfo[m[1]] = m[2];
-          }
-        });
-        // last line of block is "progress"
-        if (progressInfo["progress"]) {
-          let info = progressInfo;
-          progressInfo = {};
-          if (typeof info["out_time_ms"] !== "undefined") {
-            // out_time_ms is in ns, not ms.
-            const seconds = parseInt(info["out_time_ms"]) / 1_000_000;
-            try {
-              await rpc.call("convertOutput", options.progressTime, seconds, info);
-            } catch (_) {
-              // Extension stopped caring
-              child.kill();
+        const on_line = async (line) => {
+          let props = line.match(PROPS_RE) || [];
+          props.forEach((prop) => {
+            let m = NAMEVAL_RE.exec(prop);
+            if (m) {
+              progressInfo[m[1]] = m[2];
+            }
+          });
+          // last line of block is "progress"
+          if (progressInfo["progress"]) {
+            let info = progressInfo;
+            progressInfo = {};
+            if (typeof info["out_time_ms"] !== "undefined") {
+              // out_time_ms is in ns, not ms.
+              const seconds = parseInt(info["out_time_ms"]) / 1_000_000;
+              try {
+                await rpc.call("convertOutput", options.progressTime, seconds, info);
+              } catch (_) {
+                // Extension stopped caring
+                child.kill();
+              }
             }
           }
+        };
+
+        if (options.progressTime) {
+          child.stdout.on("data", (lines) => {
+            lines.toString("utf-8").split("\n").forEach(on_line);
+          });
         }
+
+        return on_exit;
       };
 
-      if (options.progressTime) {
-        child.stdout.on("data", (lines) => {
-          lines.toString("utf-8").split("\n").forEach(on_line);
+      let result = await runConvert(args);
+      // If a CDN refused ffmpeg's HTTP/1.1 request (e.g. an HTTP/2-only host),
+      // retry the whole convert through the local media proxy, which re-issues
+      // upstream over HTTP/2. Working (non-blocked) downloads never reach here.
+      if (
+        result.exitCode !== 0 &&
+        args.some(isHttpUrl) &&
+        looksLikeAccessBlock(result.stderr)
+      ) {
+        const proxy = new Http2MediaProxy({
+          headers: extractHeadersFromArgs(args),
+          logger,
         });
+        try {
+          await proxy.start();
+          logger.info("convert retrying via media proxy (upstream requires HTTP/2)");
+          result = await runConvert(rewriteArgsThroughProxy(args, proxy));
+        } finally {
+          proxy.stop();
+        }
       }
-
-      return on_exit;
+      return result;
     },
     // FIXME: Partly in test suite. But just for hls retrieval.
     "probe": (input, json = false, headers = []) => {
-      return new Promise((resolve, reject) => {
-        let args = [];
-        if (json) {
-          args = ["-v", "error", "-print_format", "json", "-show_format", "-show_streams"];
-        }
-        if (headers.length) {
-          args.push("-headers");
-          args.push(headers.map((h) => {
-            return h.name + ": " + h.value;
-          }).join("\r\n") + "\r\n");
-        }
-        args.push(input);
-
-        let probeProcess = spawn(ffprobe, args);
-        let stdout = "";
-        let stderr = "";
-        probeProcess.stdout.on("data", (data) => stdout += data);
-        probeProcess.stderr.on("data", (data) => stderr += data);
-        probeProcess.on("exit", (exitCode) => {
-          if (exitCode !== 0) {
-            return reject(new Error("Exit code: " + exitCode + "\n" + stderr));
-          }
-          if (json) {
-            // FIXME: not parsed?
-            resolve(stdout);
-          } else {
-            let info = {};
-            let m = /([0-9]{2,})x([0-9]{2,})/g.exec(stderr);
-            if (m) {
-              info.width = parseInt(m[1]);
-              info.height = parseInt(m[2]);
-            }
-            m = /Duration: ([0-9]{2}):([0-9]{2}):([0-9]{2})\.([0-9]{2})/g.exec(stderr);
-            if (m) {
-              info.duration = parseInt(m[1]) * 3600 + parseInt(m[2]) * 60 + parseInt(m[3]);
-            }
-            m = /Video:\s+([^\s\(,]+)/g.exec(stderr);
-            if (m) {
-              info.videoCodec = m[1];
-            }
-            m = /Audio:\s+([^\s\(,]+)/g.exec(stderr);
-            if (m) {
-              info.audioCodec = m[1];
-            }
-            m = /([0-9]+(?:\.[0-9]+)?)\s+fps\b/g.exec(stderr);
-            if (m) {
-              info.fps = parseFloat(m[1]);
-            }
-            resolve(info);
-          }
-        });
-      });
+      return probeWithProxyFallback(input, json, headers);
     },
     // FIXME: test (partly because open result is untested)
     "play": (filePath) => {
