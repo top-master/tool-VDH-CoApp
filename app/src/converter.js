@@ -158,9 +158,49 @@ function isHttpUrl(value) {
   return typeof value === "string" && /^https?:\/\//i.test(value);
 }
 
-// ffmpeg's stderr when a CDN refuses its (HTTP/1.1) request.
-function looksLikeAccessBlock(stderr) {
+// ffmpeg's stderr when an HTTP/2-only CDN refuses its HTTP/1.1 request: an
+// explicit 401/403 access block. This is the reliable HTTP/2-refusal signal.
+function looksLikeHttp2Refusal(stderr) {
   return /\b40[13]\b|access denied|Forbidden|HTTP error 40[13]/i.test(stderr || "");
+}
+
+// ffmpeg's stderr when it could not parse an input at all. This is NOT a reliable
+// HTTP/2 signal on its own - it is far more often a client-side cause the caller
+// already handles (e.g. a zstd/brotli-encoded body, or disguised HLS segment
+// extensions) - so the proxy only retries on it when the caller opts in via the
+// "-vdh_proxy_fallback invalid-data" convert flag (see takeProxyFallbackMode).
+function looksLikeUnparsableInput(stderr) {
+  return /Invalid data found when processing input|Error opening input/i.test(
+    stderr || "",
+  );
+}
+
+// The extension can widen the proxy-retry trigger for a single convert by passing
+// a two-word flag in the ffmpeg args: "-vdh_proxy_fallback invalid-data" makes a
+// convert that failed as unparsable input also retry through the media proxy.
+// It is a vdh-private directive, so strip both words here before ffmpeg sees them.
+function takeProxyFallbackMode(args) {
+  const at = args.indexOf("-vdh_proxy_fallback");
+  if (at < 0) {
+    return null;
+  }
+  const mode = args[at + 1];
+  args.splice(at, 2);
+  return mode;
+}
+
+// Safety net for any "-vdh_*" flag we did not consume by name above - typically
+// a directive a newer extension sent that this build predates. They are all
+// vdh-private, so none may reach ffmpeg (it aborts on an unknown option); drop
+// each with its value, following the same two-word convention as the named
+// takes above. Run this AFTER the known flags are taken, so only the
+// unrecognized ones remain.
+function stripVdhArgs(args) {
+  for (let at = args.length - 1; at >= 0; at--) {
+    if (typeof args[at] === "string" && args[at].startsWith("-vdh_")) {
+      args.splice(at, 2);
+    }
+  }
 }
 
 // Parse every `-headers "Name: v\r\nName2: v2\r\n"` blob in an ffmpeg arg list
@@ -261,6 +301,12 @@ exports.star_listening = () => {
       // `-progress pipe:1` send program-friendly progress information to stdin every 500ms.
       // `-hide_banner -loglevel error`: make the output less noisy.
 
+      // Take the caller's opt-in to widen the proxy retry, before ffmpeg sees it.
+      const proxyFallbackMode = takeProxyFallbackMode(args);
+      // Drop any other "-vdh_*" directive this build does not know, so a
+      // forward-compat mismatch never leaks a private flag into ffmpeg.
+      stripVdhArgs(args);
+
       // This should never happen, but just in case a third party does a convert request
       // with the old version of ffmpeg arguments, let's rewrite the arguments to fit
       // the new syntax.
@@ -344,11 +390,15 @@ exports.star_listening = () => {
       let result = await runConvert(args);
       // If a CDN refused ffmpeg's HTTP/1.1 request (e.g. an HTTP/2-only host),
       // retry the whole convert through the local media proxy, which re-issues
-      // upstream over HTTP/2. Working (non-blocked) downloads never reach here.
+      // upstream over HTTP/2. A 40x access block always qualifies; an unparsable
+      // input only when the caller opted in with "-vdh_proxy_fallback invalid-data".
+      // Working (non-blocked) downloads never reach here.
       if (
         result.exitCode !== 0 &&
         args.some(isHttpUrl) &&
-        looksLikeAccessBlock(result.stderr)
+        (looksLikeHttp2Refusal(result.stderr) ||
+          (proxyFallbackMode === "invalid-data" &&
+            looksLikeUnparsableInput(result.stderr)))
       ) {
         const proxy = new Http2MediaProxy({
           headers: extractHeadersFromArgs(args),
@@ -357,7 +407,19 @@ exports.star_listening = () => {
         try {
           await proxy.start();
           logger.info("convert retrying via media proxy (upstream requires HTTP/2)");
-          result = await runConvert(rewriteArgsThroughProxy(args, proxy));
+          const retried = await runConvert(rewriteArgsThroughProxy(args, proxy));
+          // Adopt the retry only if it actually recovered the download. On a
+          // failure keep the direct result: its stderr names the real upstream
+          // URL (not the loopback proxy), so it stays the more useful report -
+          // and the proxy retry can never make a genuine failure worse.
+          if (retried.exitCode === 0) {
+            result = retried;
+          }
+        } catch (proxyError) {
+          logger.info(
+            "media proxy retry failed: " +
+              ((proxyError && proxyError.message) || String(proxyError)),
+          );
         } finally {
           proxy.stop();
         }
