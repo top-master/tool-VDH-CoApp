@@ -45,10 +45,95 @@ function looksLikeManifest(url, contentType) {
   return /\.m3u8(\?|#|$)/i.test(url);
 }
 
+// Some sites glue a small fake image header (a tiny PNG/JPEG/GIF/... plus its
+// own end marker) onto the front of a real MPEG-TS or MP4 segment, so ffmpeg
+// sees "Video: png" and bails while their own JS player strips the prefix and
+// feeds the clean media to MSE. Undo that: only when the payload BEGINS with an
+// image magic, scan a little way in for where the real media starts (a TS packet
+// run, or an MP4 box) and drop everything before it. Anything that is not such a
+// wrapper (plain segments, AES keys, actual images) is returned untouched.
+const IMAGE_MAGICS = [
+  [0x89, 0x50, 0x4e, 0x47], // PNG
+  [0xff, 0xd8, 0xff], // JPEG
+  [0x47, 0x49, 0x46, 0x38], // GIF8
+  [0x42, 0x4d], // BMP
+  [0x52, 0x49, 0x46, 0x46], // RIFF (WEBP)
+];
+
+function startsWithImageMagic(buffer) {
+  return IMAGE_MAGICS.some((magic) =>
+    magic.every((byte, index) => buffer[index] === byte),
+  );
+}
+
+const MP4_BOX_TYPES = [
+  [0x66, 0x74, 0x79, 0x70], // ftyp
+  [0x73, 0x74, 0x79, 0x70], // styp
+  [0x6d, 0x6f, 0x6f, 0x66], // moof
+  [0x6d, 0x6f, 0x6f, 0x76], // moov
+];
+
+// Index of the first byte that begins real muxed media, or -1. A TS start is a
+// 0x47 sync that repeats at the 188-byte packet stride (at least `tsRun` packets
+// in a row - a longer run is a stronger, lower-false-positive signal); an MP4
+// start is an ftyp/styp/moof/moov box (its 4-char type sits 4 bytes into the box).
+function findMediaStart(buffer, tsRun) {
+  const limit = Math.min(buffer.length, 262144);
+  for (let i = 0; i < limit; i++) {
+    if (buffer[i] === 0x47) {
+      let run = true;
+      for (let packet = 0; packet < tsRun; packet++) {
+        if (buffer[i + packet * 188] !== 0x47) {
+          run = false;
+          break;
+        }
+      }
+      if (run) {
+        return i;
+      }
+    }
+    if (
+      MP4_BOX_TYPES.some(
+        (type) =>
+          buffer[i] === type[0] &&
+          buffer[i + 1] === type[1] &&
+          buffer[i + 2] === type[2] &&
+          buffer[i + 3] === type[3],
+      )
+    ) {
+      return i >= 4 ? i - 4 : 0; // back up over the box-size field
+    }
+  }
+  return -1;
+}
+
+// Undo an anti-download wrapper: a prefix glued in front of a real TS/MP4 segment
+// so ffmpeg can't read it while the site's own player strips it. Two passes:
+//   1. the common case - the prefix is a recognized image header (see
+//      IMAGE_MAGICS); strip up to the media, with a light TS-run confirmation
+//      since the wrapper itself is already recognized;
+//   2. otherwise - any unrecognized prefix; only strip when the payload does not
+//      already begin with media but a strong media start appears a little way in
+//      (a longer TS run, to stay clear of false positives without the image-magic
+//      confirmation). Normal segments (media at offset 0) return -> unchanged, and
+//      so do payloads with no media start at all (AES keys, real images, error
+//      pages), because a failed strip must never make a genuine response worse.
+function stripFakeMediaPrefix(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 8) {
+    return buffer;
+  }
+  if (startsWithImageMagic(buffer)) {
+    const start = findMediaStart(buffer, 3);
+    return start > 0 ? buffer.subarray(start) : buffer;
+  }
+  const start = findMediaStart(buffer, 5);
+  return start > 0 ? buffer.subarray(start) : buffer;
+}
+
 class MediaProxy {
   // headers: the extension's [{name, value}, ...] browser headers to forward
   // upstream so the CDN sees a browser-shaped request.
-  constructor({ headers = [], logger = null } = {}) {
+  constructor({ headers = [], logger = null, stripWrapper = false } = {}) {
     this.forwardHeaders = {};
     for (const header of headers) {
       if (header && header.name && !HOP_BY_HOP.has(header.name.toLowerCase())) {
@@ -56,6 +141,8 @@ class MediaProxy {
       }
     }
     this.logger = logger;
+    // Strip fake image prefixes off segments (an anti-download wrapper).
+    this.stripWrapper = stripWrapper;
     this.server = null;
     this.origin = null;
   }
@@ -104,7 +191,9 @@ class MediaProxy {
     // Configured browser headers win; forward a Range from ffmpeg (segment
     // seeking) but drop hop-by-hop headers.
     const headers = { ...this.forwardHeaders };
-    if (clientRequest.headers.range) {
+    // Forward ffmpeg's Range for seeking - but not while de-wrapping, where a
+    // partial body would put the fake prefix at an unknown offset; fetch whole.
+    if (clientRequest.headers.range && !this.stripWrapper) {
       headers.range = clientRequest.headers.range;
     }
     return headers;
@@ -133,6 +222,20 @@ class MediaProxy {
           "content-type": "application/vnd.apple.mpegurl",
         });
         clientResponse.end(rewritten);
+        return;
+      }
+      // Segment de-wrapping needs the whole body, so buffer it, strip any fake
+      // image prefix, and send the result (with a corrected Content-Length).
+      if (this.stripWrapper) {
+        const body = stripFakeMediaPrefix(
+          await streamToBuffer(upstream.stream),
+        );
+        const headers = this._responseHeaders(upstream);
+        delete headers["content-length"];
+        delete headers["Content-Length"];
+        headers["content-length"] = String(body.length);
+        clientResponse.writeHead(upstream.status, headers);
+        clientResponse.end(body);
         return;
       }
       clientResponse.writeHead(upstream.status, this._responseHeaders(upstream));
@@ -281,4 +384,4 @@ class Http2MediaProxy extends MediaProxy {
   }
 }
 
-module.exports = { MediaProxy, Http2MediaProxy };
+module.exports = { MediaProxy, Http2MediaProxy, stripFakeMediaPrefix };

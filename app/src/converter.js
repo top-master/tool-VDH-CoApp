@@ -175,18 +175,52 @@ function looksLikeUnparsableInput(stderr) {
   );
 }
 
-// The extension can widen the proxy-retry trigger for a single convert by passing
-// a two-word flag in the ffmpeg args: "-vdh_proxy_fallback invalid-data" makes a
-// convert that failed as unparsable input also retry through the media proxy.
-// It is a vdh-private directive, so strip both words here before ffmpeg sees them.
-function takeProxyFallbackMode(args) {
-  const at = args.indexOf("-vdh_proxy_fallback");
+// The extension passes per-convert directives to us as two-word "-vdh_*" flags in
+// the ffmpeg args (e.g. "-vdh_proxy_fallback invalid-data", "-vdh_loglevel warning",
+// "-vdh_strip_wrapper 1"). They are vdh-private, so take the flag + its value out
+// of the args here, before ffmpeg ever sees them. Returns the value, or null.
+function takeVdhArg(args, name) {
+  const at = args.indexOf(name);
   if (at < 0) {
     return null;
   }
-  const mode = args[at + 1];
+  const value = args[at + 1];
   args.splice(at, 2);
-  return mode;
+  return value;
+}
+
+const FFMPEG_LOG_LEVELS = new Set([
+  "quiet",
+  "panic",
+  "fatal",
+  "error",
+  "warning",
+  "info",
+  "verbose",
+  "debug",
+  "trace",
+]);
+
+// Map the extension's chosen level to a valid ffmpeg one (accepting "silent" as
+// an alias for "quiet"); fall back to "error" for anything unrecognized so a bad
+// value can never break the ffmpeg command.
+function normalizeLogLevel(level) {
+  if (level === "silent") {
+    level = "quiet";
+  }
+  return FFMPEG_LOG_LEVELS.has(level) ? level : "error";
+}
+
+// ffmpeg's stderr when the segments decode as an image, not video - the fake
+// image-header wrapper case. At `-loglevel error` the "Video: png" detail is
+// hidden and only "does not contain any stream" survives, so accept either.
+function looksLikeImageWrapped(stderr) {
+  const text = stderr || "";
+  return (
+    (/Could not find codec parameters/i.test(text) &&
+      /Video:\s*(?:png|mjpeg|bmp|gif|image)/i.test(text)) ||
+    /does not contain any stream/i.test(text)
+  );
 }
 
 // Safety net for any "-vdh_*" flag we did not consume by name above - typically
@@ -299,10 +333,14 @@ exports.star_listening = () => {
     // FIXME: Partly in test suite. But just for hls retrieval.
     "convert": async (args = ["-h"], options = {}) => {
       // `-progress pipe:1` send program-friendly progress information to stdin every 500ms.
-      // `-hide_banner -loglevel error`: make the output less noisy.
+      // `-hide_banner`: make the output less noisy.
 
-      // Take the caller's opt-in to widen the proxy retry, before ffmpeg sees it.
-      const proxyFallbackMode = takeProxyFallbackMode(args);
+      // Take the caller's per-convert vdh directives, before ffmpeg sees them:
+      // how chatty ffmpeg should be, whether to widen the proxy retry, and whether
+      // to de-wrap image-wrapped segments through the media proxy.
+      const proxyFallbackMode = takeVdhArg(args, "-vdh_proxy_fallback");
+      const logLevel = normalizeLogLevel(takeVdhArg(args, "-vdh_loglevel"));
+      const stripWrapper = takeVdhArg(args, "-vdh_strip_wrapper") === "1";
       // Drop any other "-vdh_*" directive this build does not know, so a
       // forward-compat mismatch never leaks a private flag into ffmpeg.
       stripVdhArgs(args);
@@ -321,7 +359,7 @@ exports.star_listening = () => {
         }
       }
 
-      const ffmpeg_base_args = "-progress pipe:1 -hide_banner -loglevel error";
+      const ffmpeg_base_args = `-progress pipe:1 -hide_banner -loglevel ${logLevel}`;
       args = [...ffmpeg_base_args.split(" "), ...args];
 
       // One ffmpeg run: wires progress + child tracking, resolves on exit.
@@ -388,25 +426,37 @@ exports.star_listening = () => {
       };
 
       let result = await runConvert(args);
-      // If a CDN refused ffmpeg's HTTP/1.1 request (e.g. an HTTP/2-only host),
-      // retry the whole convert through the local media proxy, which re-issues
-      // upstream over HTTP/2. A 40x access block always qualifies; an unparsable
-      // input only when the caller opted in with "-vdh_proxy_fallback invalid-data".
+      // Retry the whole convert through the local media proxy when it can help.
+      // Two independent reasons, both only on a failed convert of an http input:
+      //  - upstream refused ffmpeg's HTTP/1.1 request (an HTTP/2-only host): a 40x
+      //    access block always qualifies; an unparsable input only when the caller
+      //    opted in with "-vdh_proxy_fallback invalid-data";
+      //  - the segments are image-wrapped and the caller enabled de-wrapping with
+      //    "-vdh_strip_wrapper 1", so the proxy strips the fake prefix per segment.
       // Working (non-blocked) downloads never reach here.
+      const wantHttp2Retry =
+        looksLikeHttp2Refusal(result.stderr) ||
+        (proxyFallbackMode === "invalid-data" &&
+          looksLikeUnparsableInput(result.stderr));
+      const wantStripRetry =
+        stripWrapper && looksLikeImageWrapped(result.stderr);
       if (
         result.exitCode !== 0 &&
         args.some(isHttpUrl) &&
-        (looksLikeHttp2Refusal(result.stderr) ||
-          (proxyFallbackMode === "invalid-data" &&
-            looksLikeUnparsableInput(result.stderr)))
+        (wantHttp2Retry || wantStripRetry)
       ) {
         const proxy = new Http2MediaProxy({
           headers: extractHeadersFromArgs(args),
           logger,
+          stripWrapper: wantStripRetry,
         });
         try {
           await proxy.start();
-          logger.info("convert retrying via media proxy (upstream requires HTTP/2)");
+          logger.info(
+            wantStripRetry
+              ? "convert retrying via media proxy (de-wrapping segments)"
+              : "convert retrying via media proxy (upstream requires HTTP/2)",
+          );
           const retried = await runConvert(rewriteArgsThroughProxy(args, proxy));
           // Adopt the retry only if it actually recovered the download. On a
           // failure keep the direct result: its stderr names the real upstream

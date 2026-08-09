@@ -91,5 +91,41 @@ check(
 );
 check("blank line preserved", lines[6] === "");
 
+// 5. stripFakeMediaPrefix: undo a wrapper glued in front of real media.
+const { stripFakeMediaPrefix } = require("../app/src/media-proxy.js");
+// Build a TS body with 0x47 at each 188-byte packet boundary.
+function makeTs(packets) {
+  const ts = Buffer.alloc(188 * packets, 0);
+  for (let p = 0; p < packets; p++) ts[p * 188] = 0x47;
+  return ts;
+}
+const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82]);
+
+// (a) Known image magic in front -> stripped (array fast-path, run of 3).
+const ts3 = makeTs(3);
+const pngStripped = stripFakeMediaPrefix(Buffer.concat([png, ts3]));
+check("PNG-wrapped TS: prefix removed", pngStripped.length === ts3.length && pngStripped[0] === 0x47);
+
+// (b) UNRECOGNIZED prefix (not any image magic) -> still stripped via the general
+//     pass (needs the stronger 5-packet run).
+const junkPrefix = Buffer.alloc(100, 0xab);
+const ts6 = makeTs(6);
+const junkStripped = stripFakeMediaPrefix(Buffer.concat([junkPrefix, ts6]));
+check("unknown-prefix TS: prefix removed (general pass)", junkStripped.length === ts6.length && junkStripped[0] === 0x47);
+
+// (c) An MP4 (ftyp) after an unknown prefix -> stripped.
+const ftyp = Buffer.concat([Buffer.from([0, 0, 0, 0x18]), Buffer.from("ftypmp42", "utf8"), Buffer.alloc(200, 0)]);
+const mp4Stripped = stripFakeMediaPrefix(Buffer.concat([junkPrefix, ftyp]));
+check("unknown-prefix MP4: stripped to the box-size field", mp4Stripped.slice(4, 8).toString() === "ftyp");
+
+// Things that must be left untouched:
+check("plain TS at offset 0 untouched", stripFakeMediaPrefix(ts6).equals(ts6));
+const key = Buffer.from("0123456789abcdef", "utf8"); // 16-byte AES key
+check("AES key untouched", stripFakeMediaPrefix(key).equals(key));
+const realImage = Buffer.concat([png, Buffer.alloc(500, 0x11)]);
+check("real image (no media after) untouched", stripFakeMediaPrefix(realImage).equals(realImage));
+const errorPage = Buffer.from("<!DOCTYPE html><html>521</html>".repeat(20), "utf8");
+check("HTML error page untouched", stripFakeMediaPrefix(errorPage).equals(errorPage));
+
 console.log(failures === 0 ? "\nmedia-proxy: all passed" : `\nmedia-proxy: ${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);
